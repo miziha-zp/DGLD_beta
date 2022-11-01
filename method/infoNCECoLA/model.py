@@ -8,6 +8,20 @@ from torch.nn import init
 from  dgl.nn.pytorch import EdgeWeightNorm
 from dgl.nn.pytorch import SumPooling, AvgPooling, MaxPooling, GlobalAttentionPooling
 
+class MeanAttentionPooling(nn.Module):
+    def __init__(self, subgraph_size, tau=1.0):
+        super(MeanAttentionPooling, self).__init__()
+        self.meanpooling = AvgPooling()
+        self.subgraph_size = subgraph_size
+        self.tau = tau
+    def forward(self, graph, feat):
+        meanpooling_emb = self.meanpooling(graph, feat).unsqueeze(-1) # (batch, d, 1)
+        feat = feat.reshape((-1, self.subgraph_size, feat.shape[-1])) # (batch, subg_size, d)
+        atten_weight = torch.bmm(feat, meanpooling_emb).squeeze(-1) # (batch, subg_size)
+        atten_weight = F.softmax(atten_weight / self.tau, dim=1).unsqueeze(-1)
+        pooling_result = torch.sum(atten_weight * feat, dim=1)
+        return pooling_result
+
 class Discriminator(nn.Module):
     def __init__(self, out_feats):
         super(Discriminator, self).__init__()
@@ -30,7 +44,7 @@ class OneLayerGCNWithGlobalAdg(nn.Module):
     r"""
     a onelayer subgraph GCN can use global adjacent metrix.
     """
-    def __init__(self, in_feats, out_feats=64, global_adg=True, bias_term=True):
+    def __init__(self, in_feats, out_feats=64, global_adg=True, bias_term=True, subgraph_size=4):
         super(OneLayerGCNWithGlobalAdg, self).__init__()
         self.global_adg = global_adg
         self.norm = 'none' if global_adg else 'both'
@@ -45,10 +59,11 @@ class OneLayerGCNWithGlobalAdg(nn.Module):
         )
         self.gcn2anchor = torch.nn.Sequential(nn.Linear(out_feats, out_feats))
         self.anchormlp = torch.nn.Sequential(nn.Linear(out_feats, out_feats))
-        self.pool = AvgPooling()
         self.act = nn.PReLU()
         self.reset_parameters()
-        self.pool = AvgPooling()
+        self.subgraph_size = subgraph_size
+        self.pool = MeanAttentionPooling(subgraph_size=self.subgraph_size)
+        
 
     def reset_parameters(self):
         r"""
@@ -72,9 +87,9 @@ class OneLayerGCNWithGlobalAdg(nn.Module):
 
     def forward(self, bg, in_feat):
          
-        anchor_embs = bg.ndata['feat'][::4, :].clone()
+        anchor_embs = bg.ndata['feat'][::self.subgraph_size, :].clone()
         # Anonymization
-        bg.ndata['feat'][::4, :] = 0
+        bg.ndata['feat'][::self.subgraph_size, :] = 0
         # anchor_out
         anchor_out = torch.matmul(anchor_embs, self.weight) 
         if self.bias_term:
@@ -95,7 +110,91 @@ class OneLayerGCNWithGlobalAdg(nn.Module):
             # pooling        
             bg.ndata["h"] = h
             subgraph_pool_emb = self.pool(bg,h)
-            gcn_emb = bg.ndata['h'][::4, :].clone()
+            gcn_emb = bg.ndata['h'][::self.subgraph_size, :].clone()
+        
+        # return subgraph_pool_emb, anchor_out
+        subgraph_pool_emb = self.subg2anchor(subgraph_pool_emb)
+        gcn_emb = self.gcn2anchor(gcn_emb)
+        # anchor_out = self.anchormlp(anchor_out)
+        return F.normalize(subgraph_pool_emb, p=2, dim=1), F.normalize(anchor_out, p=2, dim=1),\
+            F.normalize(gcn_emb, p=2, dim=1)
+
+
+class MLP_GNN(nn.Module):
+    r"""
+    a onelayer subgraph GCN can use global adjacent metrix.
+    """
+    def __init__(self, in_feats, out_feats=64, global_adg=True, bias_term=True, subgraph_size=4):
+        super(MLP_GNN, self).__init__()
+        self.global_adg = global_adg
+        self.norm = 'none' if global_adg else 'both'
+        self.weight = nn.Parameter(torch.Tensor(in_feats, out_feats))
+        if bias_term:
+            self.bias = nn.Parameter(torch.Tensor(out_feats))
+            self.bias_term = bias_term
+        self.conv = GraphConv(in_feats, out_feats, weight=False, bias=False, norm=self.norm)
+        self.conv.set_allow_zero_in_degree(1)
+        self.mlp = torch.nn.Sequential(nn.Linear(in_feats, out_feats))
+        self.subg2anchor = torch.nn.Sequential(
+            nn.Linear(out_feats, out_feats)
+        )
+        self.gcn2anchor = torch.nn.Sequential(nn.Linear(out_feats, out_feats))
+        self.anchormlp = torch.nn.Sequential(nn.Linear(out_feats, out_feats))
+        self.act = nn.PReLU()
+        self.reset_parameters()
+        self.subgraph_size = subgraph_size
+        self.pool = MeanAttentionPooling(subgraph_size=self.subgraph_size)
+        
+
+    def reset_parameters(self):
+        r"""
+
+        Description
+        -----------
+        Reinitialize learnable parameters.
+
+        Note
+        ----
+        The model parameters are initialized as in the
+        `original implementation <https://github.com/tkipf/gcn/blob/master/gcn/layers.py>`__
+        where the weight :math:`W^{(l)}` is initialized using Glorot uniform initialization
+        and the bias is initialized to be zero.
+
+        """
+        if self.weight is not None:
+            init.xavier_uniform_(self.weight)
+        if self.bias is not None:
+            init.zeros_(self.bias)
+
+    def forward(self, bg, in_feat):
+         
+        anchor_embs = bg.ndata['feat'][::self.subgraph_size, :].clone()
+        # Anonymization
+        bg.ndata['feat'][::self.subgraph_size, :] = 0
+        # anchor_out
+        anchor_out = torch.matmul(anchor_embs, self.weight) 
+        if self.bias_term:
+            anchor_out = anchor_out + self.bias
+        anchor_out = self.act(anchor_out)
+        
+        in_feat = bg.ndata['feat']
+        in_feat = torch.matmul(in_feat, self.weight) 
+        # GCN
+        # if self.global_adg:
+        #     h = self.conv(bg, in_feat, edge_weight=bg.edata['w'])
+        # else:
+        #     h = self.conv(bg, in_feat)
+        # MLP
+        h = self.mlp(h)
+
+        if self.bias_term:
+            h += self.bias
+        h = self.act(h)
+        with bg.local_scope():
+            # pooling        
+            bg.ndata["h"] = h
+            subgraph_pool_emb = self.pool(bg,h)
+            gcn_emb = bg.ndata['h'][::self.subgraph_size, :].clone()
         
         # return subgraph_pool_emb, anchor_out
         subgraph_pool_emb = self.subg2anchor(subgraph_pool_emb)
@@ -105,9 +204,9 @@ class OneLayerGCNWithGlobalAdg(nn.Module):
             F.normalize(gcn_emb, p=2, dim=1)
 
 class CoLAModel(nn.Module):
-    def __init__(self, in_feats=300, out_feats=64, global_adg=True, tau=0.5, generative_loss_w=0, score_type="score1"):
+    def __init__(self, in_feats=300, out_feats=64, global_adg=True, tau=0.5, generative_loss_w=0, score_type="score1", subgraph_size=4):
         super(CoLAModel, self).__init__()
-        self.gcn = OneLayerGCNWithGlobalAdg(in_feats, out_feats, global_adg)
+        self.gcn = MLP_GNN(in_feats, out_feats, global_adg, subgraph_size=subgraph_size)
         self.discriminator = Discriminator(out_feats)
         self.tau = tau
         self.beta = generative_loss_w
@@ -186,7 +285,7 @@ class CoLAModel(nn.Module):
     def forward(self, pos_batchg, pos_in_feat, neg_batchg, neg_in_feat):
         # pos_in_feat = F.dropout(pos_in_feat, 0.2, training=self.training)
         # neg_in_feat = F.dropout(neg_in_feat, 0.2, training=self.training)
-        anchor_inputs = self.get_anchor_oral_features(pos_batchg, pos_in_feat)
+        # anchor_inputs = self.get_anchor_oral_features(pos_batchg, pos_in_feat)
         pos_pool_emb, pos_anchor_out, pos_gcn_emb = self.gcn(pos_batchg, pos_in_feat)
         neg_pool_emb, neg_anchor_out, neg_gcn_emb = self.gcn(neg_batchg, neg_in_feat)      
         loss_pool, pos_score_pool, neg_score_pool = self.infonceloss(pos_pool_emb,  \
